@@ -176,7 +176,7 @@ func One(a Adapter, t task.Task, o Options) (res task.Result) {
 }
 
 // GateRisk invokes the `gate` binary if present on PATH and extracts a 0..1 risk score.
-// Invocation: gate run --repo <dir> --diff <file> --json (override args via BENCH_GATE_ARGS,
+// Invocation: gate run --repo <dir> --diff <file> --format json (override args via BENCH_GATE_ARGS,
 // where {repo} and {diff} are substituted).
 func GateRisk(dir, diff string) *float64 {
 	bin, err := exec.LookPath("gate")
@@ -192,7 +192,7 @@ func GateRisk(dir, diff string) *float64 {
 	f.Close()
 	argTmpl := os.Getenv("BENCH_GATE_ARGS")
 	if argTmpl == "" {
-		argTmpl = "run --repo {repo} --diff {diff} --json"
+		argTmpl = "run --repo {repo} --diff {diff} --format json --exit-zero"
 	}
 	var args []string
 	for _, a := range strings.Fields(argTmpl) {
@@ -222,6 +222,12 @@ func parseRisk(out []byte) *float64 {
 				v /= 100
 			}
 			return &v
+		}
+	}
+	// Gate's native report nests the score under verdict.score.
+	if v, ok := m["verdict"].(map[string]any); ok {
+		if sc, ok := v["score"].(float64); ok {
+			return &sc
 		}
 	}
 	if d, ok := m["decision"].(map[string]any); ok {

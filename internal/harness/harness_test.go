@@ -50,6 +50,9 @@ func TestBaselinesAndShell(t *testing.T) {
 }
 
 func TestParseRisk(t *testing.T) {
+	if r := parseRisk([]byte(`{"id":"x","verdict":{"score":0.75,"decision":"reject"}}`)); r == nil || *r != 0.75 {
+		t.Fatalf("gate verdict.score not parsed: %v", r)
+	}
 	if r := parseRisk([]byte(`{"risk_score": 42}`)); r == nil || *r != 0.42 {
 		t.Fatal(r)
 	}
