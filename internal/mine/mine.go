@@ -1,0 +1,221 @@
+// Package mine walks git history and turns bug-fix commits with tests into tasks.
+package mine
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/Celaris-dev1/Bench/internal/detect"
+	"github.com/Celaris-dev1/Bench/internal/gitx"
+	"github.com/Celaris-dev1/Bench/internal/task"
+	"github.com/Celaris-dev1/Bench/internal/testrun"
+)
+
+// Options configures mining.
+type Options struct {
+	Since        string // only commits after this sha (exclusive)
+	MaxCommits   int
+	MaxDiffLines int
+	Verify       bool
+	Test         testrun.Options
+	Log          func(format string, a ...any)
+}
+
+var (
+	issueRefRe = regexp.MustCompile(`(?i)\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s*:?\s*((?:[\w.-]+/[\w.-]+)?#\d+)`)
+	hashRefRe  = regexp.MustCompile(`#\d+`)
+	bugWordRe  = regexp.MustCompile(`(?i)\b(fix(e[sd])?|bug|close[sd]?|resolve[sd]?|regression|crash|broken)\b`)
+	riskyRe    = regexp.MustCompile(`(?i)(https?://[a-z0-9]|http\.Get\(|requests\.(get|post)|\bfetch\(|net\.Dial|socket\.|api[_-]?key|secret|password|aws_|BEGIN (RSA|OPENSSH) PRIVATE|os\.Getenv\("[A-Z_]*(TOKEN|KEY)|rand\.(Seed|Int)|time\.Now\(\)\.Unix|Math\.random)`)
+)
+
+// Candidate is a commit that passed the static filters, with the reason when rejected.
+type Candidate struct {
+	Task   task.Task
+	Reject string
+}
+
+type commit struct{ sha, parent, subject, body string }
+
+func listCommits(repo string, o Options) ([]commit, error) {
+	args := []string{"log", "--no-merges", "--format=%H%x00%P%x00%s%x00%b%x1e"}
+	if o.Since != "" {
+		args = append(args, o.Since+"..HEAD")
+	}
+	if o.MaxCommits > 0 {
+		args = append(args, fmt.Sprintf("-n%d", o.MaxCommits))
+	}
+	out, err := gitx.Run(repo, args...)
+	if err != nil {
+		return nil, err
+	}
+	var cs []commit
+	for _, rec := range strings.Split(out, "\x1e") {
+		rec = strings.TrimLeft(rec, "\n")
+		p := strings.SplitN(rec, "\x00", 4)
+		if len(p) < 4 || p[1] == "" {
+			continue // root commit or empty
+		}
+		cs = append(cs, commit{p[0], strings.Fields(p[1])[0], p[2], strings.TrimSpace(p[3])})
+	}
+	return cs, nil
+}
+
+// Mine returns accepted tasks and all candidates (with rejection reasons).
+func Mine(repo string, o Options) ([]task.Task, []Candidate, error) {
+	if o.MaxDiffLines == 0 {
+		o.MaxDiffLines = 400
+	}
+	if o.Log == nil {
+		o.Log = func(string, ...any) {}
+	}
+	abs, err := filepath.Abs(repo)
+	if err != nil {
+		return nil, nil, err
+	}
+	cs, err := listCommits(abs, o)
+	if err != nil {
+		return nil, nil, err
+	}
+	var tasks []task.Task
+	var cands []Candidate
+	for _, c := range cs {
+		msg := strings.TrimSpace(c.subject + "\n\n" + c.body)
+		if !bugWordRe.MatchString(msg) && !issueRefRe.MatchString(msg) {
+			continue
+		}
+		out, err := gitx.Run(abs, "diff-tree", "--no-commit-id", "--name-only", "-r", c.parent, c.sha)
+		if err != nil {
+			return nil, nil, err
+		}
+		var tests, srcs []string
+		for _, f := range strings.Fields(out) {
+			switch {
+			case detect.IsTest(f):
+				tests = append(tests, f)
+			case detect.IsSource(f):
+				srcs = append(srcs, f)
+			}
+		}
+		if len(tests) == 0 || len(srcs) == 0 {
+			continue
+		}
+		t := task.Task{
+			ID: fmt.Sprintf("%s-%s", filepath.Base(abs), c.sha[:10]), Repo: abs, Commit: c.sha, Parent: c.parent,
+			Prompt: msg, IssueRefs: refs(msg), Language: detect.Language(srcs), Runner: detect.Runner(abs, detect.Language(srcs)), TestFiles: tests, SourceFiles: srcs,
+			MinedAt: time.Now().UTC(),
+		}
+		t.GoldDiff, _ = gitx.Run(abs, append([]string{"diff", "--binary", c.parent, c.sha, "--"}, srcs...)...)
+		t.TestDiff, _ = gitx.Run(abs, append([]string{"diff", "--binary", c.parent, c.sha, "--"}, tests...)...)
+		t.DiffLines = countChanged(t.GoldDiff)
+		t.Score = score(t)
+		cand := Candidate{Task: t, Reject: staticReject(t, o)}
+		if cand.Reject == "" && o.Verify {
+			o.Log("verifying %s", t.ID)
+			cand.Reject = verify(abs, &cand.Task, o)
+		}
+		cands = append(cands, cand)
+		if cand.Reject == "" {
+			tasks = append(tasks, cand.Task)
+			o.Log("accepted %s", t.ID)
+		} else {
+			o.Log("rejected %s: %s", t.ID, cand.Reject)
+		}
+	}
+	sort.SliceStable(tasks, func(i, j int) bool { return tasks[i].Score > tasks[j].Score })
+	return tasks, cands, nil
+}
+
+func refs(msg string) []string {
+	var r []string
+	seen := map[string]bool{}
+	for _, m := range hashRefRe.FindAllString(msg, -1) {
+		if !seen[m] {
+			seen[m] = true
+			r = append(r, m)
+		}
+	}
+	return r
+}
+
+func countChanged(diff string) int {
+	n := 0
+	for _, l := range strings.Split(diff, "\n") {
+		if (strings.HasPrefix(l, "+") && !strings.HasPrefix(l, "+++")) || (strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "---")) {
+			n++
+		}
+	}
+	return n
+}
+
+// score ranks tasks: clearer descriptions and smaller diffs rank higher.
+func score(t task.Task) float64 {
+	words := len(strings.Fields(t.Prompt))
+	clarity := float64(words)
+	if clarity > 60 {
+		clarity = 60
+	}
+	s := clarity / 60
+	if len(t.IssueRefs) > 0 {
+		s += 0.5
+	}
+	s += 1.0 / (1.0 + float64(t.DiffLines)/20.0)
+	return s
+}
+
+func staticReject(t task.Task, o Options) string {
+	if t.DiffLines == 0 {
+		return "empty source diff"
+	}
+	if t.DiffLines > o.MaxDiffLines {
+		return fmt.Sprintf("diff too large (%d > %d lines)", t.DiffLines, o.MaxDiffLines)
+	}
+	if len(strings.Fields(t.Prompt)) < 3 {
+		return "description too short"
+	}
+	for _, d := range []string{t.GoldDiff, t.TestDiff} {
+		for _, l := range strings.Split(d, "\n") {
+			if strings.HasPrefix(l, "+") && riskyRe.MatchString(l) {
+				return "network/secret/non-determinism hint: " + strings.TrimSpace(strings.TrimPrefix(l, "+"))
+			}
+		}
+	}
+	return ""
+}
+
+// verify checks tests fail at parent+tests and pass at commit, in a throwaway worktree.
+func verify(repo string, t *task.Task, o Options) string {
+	dir, err := os.MkdirTemp("", "bench-verify-")
+	if err != nil {
+		return err.Error()
+	}
+	os.Remove(dir)
+	wt, err := gitx.AddWorktree(repo, dir, t.Parent)
+	if err != nil {
+		return "worktree: " + err.Error()
+	}
+	defer wt.Remove()
+	t.Runner = detect.Runner(dir, t.Language)
+	argv := detect.Command(t.Runner, t.TestFiles)
+	if argv == nil {
+		return "no test runner detected"
+	}
+	if err := wt.CheckoutFiles(t.Commit, t.TestFiles); err != nil {
+		return "checkout tests: " + err.Error()
+	}
+	if pre := testrun.Run(dir, argv, o.Test); pre.Passed {
+		return "tests already pass before fix"
+	}
+	if err := wt.Apply(t.GoldDiff); err != nil {
+		return "apply gold diff: " + err.Error()
+	}
+	if post := testrun.Run(dir, argv, o.Test); !post.Passed {
+		return "tests fail after fix (flaky or environment-dependent)"
+	}
+	t.Verified = true
+	return ""
+}
