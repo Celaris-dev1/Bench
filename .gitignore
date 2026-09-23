@@ -1,0 +1,4 @@
+/bench
+/.bench/
+*.out
+.env
