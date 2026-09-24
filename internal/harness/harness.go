@@ -322,7 +322,7 @@ func One(a Adapter, t task.Task, o Options) (res task.Result) {
 	res.Passed = agentErr == nil && applyErr == nil && out.Passed
 
 	if o.UseGate && strings.TrimSpace(res.AgentDiff) != "" {
-		res.RiskScore = GateRisk(sb.Dir, res.AgentDiff)
+		res.RiskScore, res.GateRunID = GateRisk(sb.Dir, res.AgentDiff)
 	}
 	if !res.Passed {
 		in := classify.Input{Prompt: t.Prompt, AgentDiff: res.AgentDiff, GoldDiff: t.GoldDiff, Output: out.Output, TimedOut: out.TimedOut, Risk: res.RiskScore}
@@ -336,17 +336,19 @@ func One(a Adapter, t task.Task, o Options) (res task.Result) {
 	return res
 }
 
-// GateRisk invokes the `gate` binary if present on PATH and extracts a 0..1 risk score.
-// Invocation: gate run --repo <dir> --diff <file> --format json (override args via BENCH_GATE_ARGS,
-// where {repo} and {diff} are substituted).
-func GateRisk(dir, diff string) *float64 {
+// GateRisk invokes the `gate` binary if present on PATH and extracts a 0..1 risk score, plus
+// Gate's own run id (its report's "id" field, the same id Gate signs its gate.verdict
+// stack-receipt over — see docs/receipt-spec.md in Ledger) so this Bench run's own receipt can
+// link to the Gate run it read. Invocation: gate run --repo <dir> --diff <file> --format json
+// (override args via BENCH_GATE_ARGS, where {repo} and {diff} are substituted).
+func GateRisk(dir, diff string) (*float64, string) {
 	bin, err := exec.LookPath("gate")
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	f, err := os.CreateTemp("", "bench-diff-*.patch")
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	defer os.Remove(f.Name())
 	f.WriteString(diff)
@@ -365,7 +367,19 @@ func GateRisk(dir, diff string) *float64 {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dir
 	out, _ := cmd.Output()
-	return parseRisk(out)
+	return parseRisk(out), parseGateRunID(out)
+}
+
+func parseGateRunID(out []byte) string {
+	var m map[string]any
+	if json.Unmarshal(out, &m) != nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) == 0 || json.Unmarshal([]byte(lines[len(lines)-1]), &m) != nil {
+			return ""
+		}
+	}
+	id, _ := m["id"].(string)
+	return id
 }
 
 func parseRisk(out []byte) *float64 {

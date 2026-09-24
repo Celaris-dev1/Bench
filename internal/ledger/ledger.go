@@ -9,11 +9,17 @@ package ledger
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
+
+	"github.com/Celaris-dev1/Bench/internal/receipt"
 )
 
 // Actor is one element of an actor chain.
@@ -146,6 +152,9 @@ func (r *Recorder) Emit(typ, goal string, actors []Actor, payload map[string]any
 	}
 	chain := append([]Actor{HumanActor()}, actors...)
 	chain = append(chain, Actor{Kind: "service", ID: "bench"})
+	if typ == "bench.run.scored" {
+		attachReceipt(chain, goal, payload)
+	}
 	rec := Record{Chain: "bench", Type: typ, GoalID: goal, ActorChain: chain, Payload: payload}
 	var be backend
 	if r.spool != nil {
@@ -154,4 +163,56 @@ func (r *Recorder) Emit(typ, goal string, actors []Actor, payload map[string]any
 		be = &httpBackend{URL: r.URL, Token: r.Token, HTTP: r.HTTP}
 	}
 	return be.Record(context.Background(), rec)
+}
+
+// receiptSigner lazily loads (or generates) the Ed25519 key Bench signs stack-receipt/v1 score
+// envelopes with. BENCH_RECEIPT_KEY is a base64 32-byte seed; unset generates an ephemeral
+// per-process key.
+var (
+	receiptSignerOnce sync.Once
+	receiptSignerKey  receipt.Ed25519Signer
+)
+
+func receiptSigner() receipt.Ed25519Signer {
+	receiptSignerOnce.Do(func() {
+		if seed := os.Getenv("BENCH_RECEIPT_KEY"); seed != "" {
+			if b, err := base64.StdEncoding.DecodeString(seed); err == nil && len(b) == ed25519.SeedSize {
+				receiptSignerKey = receipt.Ed25519Signer{Key: ed25519.NewKeyFromSeed(b)}
+				return
+			}
+			log.Print("BENCH_RECEIPT_KEY: invalid, ignoring (want base64 32-byte seed)")
+		}
+		_, priv, _ := ed25519.GenerateKey(nil)
+		receiptSignerKey = receipt.Ed25519Signer{Key: priv}
+	})
+	return receiptSignerKey
+}
+
+// attachReceipt signs a stack-receipt/v1 envelope over a bench.run.scored payload and sets
+// payload["receipt"], linking to the Gate run this bench run read (payload["gate_run_id"], set
+// by cmd/bench when --gate is used) when present. It never fails the caller.
+func attachReceipt(chain []Actor, goal string, payload map[string]any) {
+	ph, err := receipt.PayloadHash(payload)
+	if err != nil {
+		log.Printf("receipt: payload_hash: %v", err)
+		return
+	}
+	racts := make([]receipt.Actor, len(chain))
+	for i, a := range chain {
+		racts[i] = receipt.Actor{Kind: a.Kind, ID: a.ID, Model: a.Model, ModelVersion: a.ModelVersion}
+	}
+	var links []receipt.Link
+	if runID, _ := payload["gate_run_id"].(string); runID != "" {
+		links = append(links, receipt.Link{Product: "gate", ID: runID})
+	}
+	subject, _ := payload["task_id"].(string)
+	env, err := receipt.Sign(context.Background(), receiptSigner(), receipt.Envelope{
+		Product: "bench", Kind: "bench.score", GoalID: goal, Actors: racts,
+		Subject: subject, PayloadHash: ph, Links: links,
+	})
+	if err != nil {
+		log.Printf("receipt: sign: %v", err)
+		return
+	}
+	payload["receipt"] = env
 }

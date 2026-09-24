@@ -249,6 +249,9 @@ func doRun(st store.Store, rec *ledger.Recorder, spec string, f runFlags) (task.
 		if r.RiskScore != nil {
 			p["risk_score"] = *r.RiskScore
 		}
+		if r.GateRunID != "" {
+			p["gate_run_id"] = r.GateRunID
+		}
 		if err := rec.Emit("bench.run.scored", r.TaskID, []ledger.Actor{agent}, p); err != nil {
 			logf("ledger: %v", err)
 		}

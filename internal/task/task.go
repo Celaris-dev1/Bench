@@ -29,6 +29,7 @@ type Result struct {
 	Passed      bool     `json:"passed"`
 	FailureMode string   `json:"failure_mode,omitempty"`
 	RiskScore   *float64 `json:"risk_score,omitempty"`
+	GateRunID   string   `json:"gate_run_id,omitempty"`
 	AgentDiff   string   `json:"agent_diff,omitempty"`
 	Output      string   `json:"output,omitempty"`
 	DurationMS  int64    `json:"duration_ms"`
