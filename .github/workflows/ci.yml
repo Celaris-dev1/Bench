@@ -1,8 +1,34 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
 jobs:
-  test:
+  build-and-vet:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go build ./...
+      - run: go vet ./...
+
+  test-no-db:
+    # Storage falls back to JSON files under .bench/ without BENCH_TEST_DATABASE_URL/
+    # BENCH_DATABASE_URL: internal/store's Postgres tests self-skip, everything else runs as
+    # normal. Exercises that path explicitly, separately from the Postgres-backed run below.
+    runs-on: ubuntu-latest
+    needs: build-and-vet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go test -race -count=1 ./...
+
+  test-with-db:
+    runs-on: ubuntu-latest
+    needs: build-and-vet
     services:
       postgres:
         image: postgres:16
@@ -10,13 +36,47 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: bench
         ports: ["5432:5432"]
-        options: --health-cmd pg_isready --health-interval 2s --health-retries 20
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 20
     env:
       BENCH_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/bench
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.24" }
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test ./...
+        with:
+          go-version: "1.24"
+      - run: go test -race -count=1 ./...
+
+  fuzz-smoke:
+    # Brief run of every fuzz target over the parsers that see untrusted input directly, so a
+    # regression that makes one of them panic fails CI instead of waiting for someone to run
+    # `go test -fuzz` locally.
+    runs-on: ubuntu-latest
+    needs: build-and-vet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go test -run '^$' -fuzz FuzzRefs -fuzztime 20s ./internal/mine/
+      - run: go test -run '^$' -fuzz FuzzCountChanged -fuzztime 20s ./internal/mine/
+      - run: go test -run '^$' -fuzz FuzzGitHubJSONDecode -fuzztime 20s ./internal/mine/
+      - run: go test -run '^$' -fuzz FuzzHeuristic -fuzztime 20s ./internal/classify/
+      - name: Upload new fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: internal/**/testdata/fuzz/**
+
+  e2e:
+    # Real-binary end-to-end suite: mine a fixture repo, run gold/noop/a fake shell agent with
+    # --trials, report, compare, watch --once.
+    runs-on: ubuntu-latest
+    needs: build-and-vet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: scripts/e2e.sh

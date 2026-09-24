@@ -12,6 +12,7 @@ import (
 
 	"github.com/Celaris-dev1/Bench/internal/detect"
 	"github.com/Celaris-dev1/Bench/internal/gitx"
+	"github.com/Celaris-dev1/Bench/internal/pathsafe"
 	"github.com/Celaris-dev1/Bench/internal/task"
 	"github.com/Celaris-dev1/Bench/internal/testrun"
 )
@@ -74,8 +75,11 @@ func (c *ghClient) get(ctx context.Context, pathOrURL string, out any) (next str
 		if err != nil {
 			return "", err
 		}
-		body, readErr := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRemoteResponseBytes+1))
 		resp.Body.Close()
+		if readErr == nil && len(body) > maxRemoteResponseBytes {
+			return "", fmt.Errorf("github: GET %s: response exceeds %d bytes", pathOrURL, maxRemoteResponseBytes)
+		}
 		if readErr != nil {
 			return "", readErr
 		}
@@ -245,6 +249,12 @@ func mineOnePR(ctx context.Context, cl *ghClient, o GitHubOptions, pr ghPR) (*Ca
 	}
 	var tests, srcs []string
 	for _, f := range files {
+		// GitHub's file list names are attacker-influenceable (anyone can open a PR); the same
+		// path-traversal reasoning as local history mining applies before they're used as
+		// worktree-relative paths.
+		if !pathsafe.Check(f.Filename) {
+			continue
+		}
 		switch {
 		case detect.IsTest(f.Filename):
 			tests = append(tests, f.Filename)

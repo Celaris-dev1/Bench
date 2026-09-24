@@ -1,4 +1,5 @@
 /bench
+/bin/
 /.bench/
 *.out
 .env
