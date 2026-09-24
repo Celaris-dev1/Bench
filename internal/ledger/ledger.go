@@ -9,14 +9,11 @@ package ledger
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/Celaris-dev1/Bench/internal/receipt"
@@ -165,27 +162,15 @@ func (r *Recorder) Emit(typ, goal string, actors []Actor, payload map[string]any
 	return be.Record(context.Background(), rec)
 }
 
-// receiptSigner lazily loads (or generates) the Ed25519 key Bench signs stack-receipt/v1 score
-// envelopes with. BENCH_RECEIPT_KEY is a base64 32-byte seed; unset generates an ephemeral
-// per-process key.
-var (
-	receiptSignerOnce sync.Once
-	receiptSignerKey  receipt.Ed25519Signer
-)
-
+// receiptSigner returns the process-wide Ed25519 key Bench signs stack-receipt/v1 score
+// envelopes with: BENCH_RECEIPT_KEY (base64 32-byte seed) or a key persisted at
+// BENCH_RECEIPT_KEY_FILE / <user config dir>/bench/receipt.key, falling back to an ephemeral
+// per-process key with a logged warning. See receipt.DefaultSigner.
 func receiptSigner() receipt.Ed25519Signer {
-	receiptSignerOnce.Do(func() {
-		if seed := os.Getenv("BENCH_RECEIPT_KEY"); seed != "" {
-			if b, err := base64.StdEncoding.DecodeString(seed); err == nil && len(b) == ed25519.SeedSize {
-				receiptSignerKey = receipt.Ed25519Signer{Key: ed25519.NewKeyFromSeed(b)}
-				return
-			}
-			log.Print("BENCH_RECEIPT_KEY: invalid, ignoring (want base64 32-byte seed)")
-		}
-		_, priv, _ := ed25519.GenerateKey(nil)
-		receiptSignerKey = receipt.Ed25519Signer{Key: priv}
-	})
-	return receiptSignerKey
+	// DefaultSigner only errors on a broken CSPRNG (crypto/rand.Read failing), which
+	// nothing here can recover from either; fall through to a zero-value signer.
+	s, _ := receipt.DefaultSigner()
+	return s
 }
 
 // attachReceipt signs a stack-receipt/v1 envelope over a bench.run.scored payload and sets

@@ -32,9 +32,11 @@ Usage:
   bench report [--format md|html] [--out file] [--repo path]
   bench compare --a agentName[/model] --b agentName[/model] [--repo path]
   bench watch  --repo <path> [--interval 60s] [--agent spec ...] [--once]
+  bench keys show
 
 Storage: BENCH_DATABASE_URL (postgres://...) or JSON files under --data (default .bench).
 Ledger:  LEDGER_URL / LEDGER_TOKEN (optional).
+Receipt signing key: BENCH_RECEIPT_KEY / BENCH_RECEIPT_KEY_FILE (see 'bench keys show').
 `
 
 func main() {
@@ -56,6 +58,8 @@ func main() {
 		err = cmdCompare(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
+	case "keys":
+		err = cmdKeys(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
