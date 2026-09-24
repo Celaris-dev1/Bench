@@ -94,3 +94,22 @@ func (w *Worktree) Apply(patch string) error {
 	_, err := RunInput(w.Dir, patch, "apply", "--whitespace=nowarn", "-")
 	return err
 }
+
+// ShowFile returns a file's content as of rev in repo, read directly from
+// the repository's object store (never through a Sandbox), so callers can
+// fetch held-out file content and inject it into an isolated Sandbox
+// without ever giving the sandbox itself access to repo's history. The
+// second return is false if the file did not exist at rev.
+func ShowFile(repo, rev, path string) ([]byte, bool, error) {
+	if _, err := Run(repo, "cat-file", "-e", rev+":"+path); err != nil {
+		return nil, false, nil
+	}
+	cmd := exec.Command("git", "show", rev+":"+path)
+	cmd.Dir = repo
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return nil, false, fmt.Errorf("git show %s:%s: %v: %s", rev, path, err, strings.TrimSpace(errb.String()))
+	}
+	return out.Bytes(), true, nil
+}

@@ -33,6 +33,10 @@ type Result struct {
 	Output      string   `json:"output,omitempty"`
 	DurationMS  int64    `json:"duration_ms"`
 	Error       string   `json:"error,omitempty"`
+	Transcript  string   `json:"transcript,omitempty"`
+	TokensIn    int      `json:"tokens_in,omitempty"`
+	TokensOut   int      `json:"tokens_out,omitempty"`
+	CostUSD     *float64 `json:"cost_usd,omitempty"`
 }
 
 // Run is one evaluation of an agent over a task set.
@@ -43,6 +47,15 @@ type Run struct {
 	Model     string    `json:"model"`
 	StartedAt time.Time `json:"started_at"`
 	Results   []Result  `json:"results"`
+}
+
+// PerTask groups a run's results by task id, preserving trial order.
+func (r Run) PerTask() map[string][]Result {
+	m := map[string][]Result{}
+	for _, x := range r.Results {
+		m[x.TaskID] = append(m[x.TaskID], x)
+	}
+	return m
 }
 
 // PassRate returns fraction of passed results.

@@ -24,9 +24,13 @@ const usage = `bench — repo-native, self-generating evaluation harness
 
 Usage:
   bench mine   --repo <path> [--since sha] [--max-diff 400] [--no-verify] [--docker image]
+  bench mine   --github owner/repo [--repo <local-clone>] [--max-prs N]  (GITHUB_TOKEN optional)
+  bench mine   --from-gate <gate-results.json-or-dir> [--repo <local-clone>]
+  bench mine   --from-ledger <ledger-url> --chain <chain> [--repo <local-clone>]
   bench tasks  [--repo <path>]
-  bench run    --agent gold|noop|shell:<cmd> [--name n] [--model m] [--repo path] [--task id] [--gate] [--llm]
+  bench run    --agent gold|noop|shell:<cmd> [--name n] [--model m] [--repo path] [--task id] [--gate] [--llm] [--trials N]
   bench report [--format md|html] [--out file] [--repo path]
+  bench compare --a agentName[/model] --b agentName[/model] [--repo path]
   bench watch  --repo <path> [--interval 60s] [--agent spec ...] [--once]
 
 Storage: BENCH_DATABASE_URL (postgres://...) or JSON files under --data (default .bench).
@@ -48,6 +52,8 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "report":
 		err = cmdReport(os.Args[2:])
+	case "compare":
+		err = cmdCompare(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
 	case "-h", "--help", "help":
@@ -91,10 +97,10 @@ func absRepo(p string) string {
 }
 
 type mineFlags struct {
-	repo, since, docker string
-	maxDiff, maxCommits int
-	noVerify            bool
-	timeout             time.Duration
+	repo, since, docker, github string
+	maxDiff, maxCommits, maxPRs int
+	noVerify                    bool
+	timeout                     time.Duration
 }
 
 func bindMine(fs *flag.FlagSet, m *mineFlags) {
@@ -105,11 +111,32 @@ func bindMine(fs *flag.FlagSet, m *mineFlags) {
 	fs.IntVar(&m.maxCommits, "max-commits", 0, "limit commits scanned (0 = all)")
 	fs.BoolVar(&m.noVerify, "no-verify", false, "skip fail-before/pass-after verification")
 	fs.DurationVar(&m.timeout, "test-timeout", 5*time.Minute, "per test invocation timeout")
+	fs.StringVar(&m.github, "github", "", "mine merged PRs from owner/repo via the GitHub API instead of local history (--repo is still used to compute diffs/verify, if given; GITHUB_TOKEN is optional but raises the rate limit)")
+	fs.IntVar(&m.maxPRs, "max-prs", 0, "limit merged PRs scanned with --github (0 = no limit)")
 }
 
 func doMine(st store.Store, rec *ledger.Recorder, m mineFlags) ([]task.Task, error) {
-	tasks, cands, err := mine.Mine(m.repo, mine.Options{Since: m.since, MaxCommits: m.maxCommits, MaxDiffLines: m.maxDiff, Verify: !m.noVerify,
-		Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf})
+	var tasks []task.Task
+	var cands []mine.Candidate
+	var err error
+	if m.github != "" {
+		owner, repo, ok := strings.Cut(m.github, "/")
+		if !ok {
+			return nil, fmt.Errorf("--github wants owner/repo, got %q", m.github)
+		}
+		local := m.repo
+		if local == "." {
+			local = "" // don't accidentally treat cwd as the clone unless the user actually pointed --repo at one
+		}
+		tasks, cands, err = mine.MineGitHub(context.Background(), mine.GitHubOptions{
+			Owner: owner, Repo: repo, Token: os.Getenv("GITHUB_TOKEN"), LocalRepo: absRepo(local),
+			MaxPRs: m.maxPRs, Verify: !m.noVerify, MaxDiffLines: m.maxDiff,
+			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf,
+		})
+	} else {
+		tasks, cands, err = mine.Mine(m.repo, mine.Options{Since: m.since, MaxCommits: m.maxCommits, MaxDiffLines: m.maxDiff, Verify: !m.noVerify,
+			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -166,14 +193,14 @@ func cmdTasks(args []string) error {
 }
 
 type runFlags struct {
-	name, model, repo, taskID, docker string
-	gate, llm                         bool
-	limit                             int
-	timeout, agentTimeout             time.Duration
+	name, model, repo, taskID, docker, agentDocker string
+	gate, llm, agentDockerNetwork                  bool
+	limit, trials                                  int
+	timeout, agentTimeout                          time.Duration
 }
 
 func doRun(st store.Store, rec *ledger.Recorder, spec string, f runFlags) (task.Run, error) {
-	a, err := harness.ParseAdapter(spec)
+	a, err := harness.ParseAdapter(spec, harness.AdapterOptions{DockerImage: f.agentDocker, DockerNetwork: f.agentDockerNetwork})
 	if err != nil {
 		return task.Run{}, err
 	}
@@ -198,7 +225,7 @@ func doRun(st store.Store, rec *ledger.Recorder, spec string, f runFlags) (task.
 	if name == "" {
 		name = a.Name()
 	}
-	run := harness.Evaluate(a, sel, harness.Options{AgentName: name, Model: f.model, UseGate: f.gate, UseLLM: f.llm, AgentTimeout: f.agentTimeout,
+	run := harness.Evaluate(a, sel, harness.Options{AgentName: name, Model: f.model, UseGate: f.gate, UseLLM: f.llm, AgentTimeout: f.agentTimeout, Trials: f.trials,
 		Test: testrun.Options{Timeout: f.timeout, DockerImage: f.docker}, Log: logf})
 	if err := st.SaveRun(context.Background(), run); err != nil {
 		return run, err
@@ -224,7 +251,10 @@ func bindRun(fs *flag.FlagSet, f *runFlags) {
 	fs.BoolVar(&f.gate, "gate", false, "score diffs with `gate` if on PATH")
 	fs.BoolVar(&f.llm, "llm", false, "classify failures with Claude (needs ANTHROPIC_API_KEY)")
 	fs.IntVar(&f.limit, "limit", 0, "max tasks")
+	fs.IntVar(&f.trials, "trials", 1, "trials per task (for pass@k and variance)")
 	fs.DurationVar(&f.agentTimeout, "agent-timeout", 30*time.Minute, "per task agent timeout")
+	fs.StringVar(&f.agentDocker, "agent-docker", "", "run the agent itself inside this Docker image")
+	fs.BoolVar(&f.agentDockerNetwork, "agent-docker-network", true, "allow network from --agent-docker (most agent CLIs need to reach their API)")
 }
 
 func cmdRun(args []string) error {
@@ -281,6 +311,64 @@ func cmdReport(args []string) error {
 		return report.HTML(w, es)
 	}
 	report.Markdown(w, es)
+	return nil
+}
+
+// latestRun returns the most recent run for spec ("agent" or "agent/model").
+func latestRun(runs []task.Run, spec string) (task.Run, error) {
+	agent, model, _ := strings.Cut(spec, "/")
+	var best task.Run
+	found := false
+	for _, r := range runs {
+		if r.Agent != agent || (model != "" && r.Model != model) {
+			continue
+		}
+		if !found || r.StartedAt.After(best.StartedAt) {
+			best, found = r, true
+		}
+	}
+	if !found {
+		return task.Run{}, fmt.Errorf("no run found for %q", spec)
+	}
+	return best, nil
+}
+
+func cmdCompare(args []string) error {
+	fs := flag.NewFlagSet("compare", flag.ExitOnError)
+	var c common
+	c.bind(fs)
+	a := fs.String("a", "", "first agent, as \"agent\" or \"agent/model\" (uses its latest run)")
+	b := fs.String("b", "", "second agent, as \"agent\" or \"agent/model\"")
+	repo := fs.String("repo", "", "filter by repository")
+	fs.Parse(args)
+	if *a == "" || *b == "" {
+		return fmt.Errorf("--a and --b required")
+	}
+	st, err := c.open()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	runs, err := st.Runs(context.Background(), absRepo(*repo))
+	if err != nil {
+		return err
+	}
+	ra, err := latestRun(runs, *a)
+	if err != nil {
+		return err
+	}
+	rb, err := latestRun(runs, *b)
+	if err != nil {
+		return err
+	}
+	cmp := report.Compare(ra, rb)
+	fmt.Printf("%s/%s: %.1f%%   %s/%s: %.1f%%   (%d common tasks)\n", cmp.AgentA, cmp.ModelA, cmp.PassRateA*100, cmp.AgentB, cmp.ModelB, cmp.PassRateB*100, cmp.TasksCompared)
+	fmt.Printf("McNemar: chi2=%.3f p=%.4f (A-only wins=%d, B-only wins=%d)\n", cmp.McNemarChi2, cmp.McNemarP, cmp.AOnly, cmp.BOnly)
+	sig := "not significant"
+	if cmp.Significant {
+		sig = "SIGNIFICANT"
+	}
+	fmt.Printf("Paired bootstrap: diff=%+.1f pts, 95%% CI=[%+.1f, %+.1f] pts -- %s\n", cmp.DiffEstimate*100, cmp.DiffCILo*100, cmp.DiffCIHi*100, sig)
 	return nil
 }
 
