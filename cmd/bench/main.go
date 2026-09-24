@@ -166,14 +166,14 @@ func cmdTasks(args []string) error {
 }
 
 type runFlags struct {
-	name, model, repo, taskID, docker string
-	gate, llm                         bool
-	limit                             int
-	timeout, agentTimeout             time.Duration
+	name, model, repo, taskID, docker, agentDocker string
+	gate, llm, agentDockerNetwork                  bool
+	limit, trials                                  int
+	timeout, agentTimeout                          time.Duration
 }
 
 func doRun(st store.Store, rec *ledger.Recorder, spec string, f runFlags) (task.Run, error) {
-	a, err := harness.ParseAdapter(spec)
+	a, err := harness.ParseAdapter(spec, harness.AdapterOptions{DockerImage: f.agentDocker, DockerNetwork: f.agentDockerNetwork})
 	if err != nil {
 		return task.Run{}, err
 	}
@@ -224,7 +224,10 @@ func bindRun(fs *flag.FlagSet, f *runFlags) {
 	fs.BoolVar(&f.gate, "gate", false, "score diffs with `gate` if on PATH")
 	fs.BoolVar(&f.llm, "llm", false, "classify failures with Claude (needs ANTHROPIC_API_KEY)")
 	fs.IntVar(&f.limit, "limit", 0, "max tasks")
+	fs.IntVar(&f.trials, "trials", 1, "trials per task (for pass@k and variance)")
 	fs.DurationVar(&f.agentTimeout, "agent-timeout", 30*time.Minute, "per task agent timeout")
+	fs.StringVar(&f.agentDocker, "agent-docker", "", "run the agent itself inside this Docker image")
+	fs.BoolVar(&f.agentDockerNetwork, "agent-docker-network", true, "allow network from --agent-docker (most agent CLIs need to reach their API)")
 }
 
 func cmdRun(args []string) error {

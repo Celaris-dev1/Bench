@@ -6,7 +6,10 @@ import (
 	"context"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/Celaris-dev1/Bench/internal/dockerx"
 )
 
 // Options controls how tests run.
@@ -22,7 +25,45 @@ type Outcome struct {
 	Output   string
 }
 
-// Run executes argv inside dir.
+// verifyNoNetwork is overridable in tests so they don't need a real docker
+// daemon to exercise the caching/refusal logic.
+var verifyNoNetwork = dockerx.VerifyNoNetwork
+
+var (
+	verifiedMu    sync.Mutex
+	verifiedCache = map[string]error{}
+)
+
+// ensureNoNetwork verifies (once per image, cached for the process
+// lifetime) that DockerImage really has no network access, per
+// dockerx.VerifyNoNetwork, and refuses to proceed otherwise.
+func ensureNoNetwork(ctx context.Context, image string) error {
+	verifiedMu.Lock()
+	if err, ok := verifiedCache[image]; ok {
+		verifiedMu.Unlock()
+		return err
+	}
+	verifiedMu.Unlock()
+	_, err := verifyNoNetwork(ctx, image)
+	verifiedMu.Lock()
+	verifiedCache[image] = err
+	verifiedMu.Unlock()
+	return err
+}
+
+// ResetVerifyCache clears the per-image no-network verification cache; used
+// by tests.
+func ResetVerifyCache() {
+	verifiedMu.Lock()
+	verifiedCache = map[string]error{}
+	verifiedMu.Unlock()
+}
+
+// Run executes argv inside dir. When o.DockerImage is set, Bench first
+// verifies (see internal/dockerx) that a --network none container from that
+// image genuinely cannot reach the network, and refuses to run tests
+// otherwise -- silently trusting a broken or misconfigured sandbox would
+// defeat the point of running untrusted agent diffs in it.
 func Run(dir string, argv []string, o Options) Outcome {
 	if len(argv) == 0 {
 		return Outcome{Output: "no test command for runner"}
@@ -33,7 +74,12 @@ func Run(dir string, argv []string, o Options) Outcome {
 	ctx, cancel := context.WithTimeout(context.Background(), o.Timeout)
 	defer cancel()
 	if o.DockerImage != "" {
-		argv = append([]string{"docker", "run", "--rm", "--network", "none", "-v", dir + ":/work", "-w", "/work", o.DockerImage}, argv...)
+		if err := ensureNoNetwork(ctx, o.DockerImage); err != nil {
+			return Outcome{Output: "[bench] " + err.Error()}
+		}
+		argv = append([]string{"docker"}, dockerx.Args(dockerx.RunOptions{
+			Image: o.DockerImage, Dir: dir, Network: false, Command: argv,
+		})...)
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir

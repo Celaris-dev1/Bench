@@ -33,6 +33,10 @@ type Result struct {
 	Output      string   `json:"output,omitempty"`
 	DurationMS  int64    `json:"duration_ms"`
 	Error       string   `json:"error,omitempty"`
+	Transcript  string   `json:"transcript,omitempty"`
+	TokensIn    int      `json:"tokens_in,omitempty"`
+	TokensOut   int      `json:"tokens_out,omitempty"`
+	CostUSD     *float64 `json:"cost_usd,omitempty"`
 }
 
 // Run is one evaluation of an agent over a task set.

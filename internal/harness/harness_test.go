@@ -29,21 +29,21 @@ func TestBaselinesAndShell(t *testing.T) {
 	}
 	fixed := filepath.Join(t.TempDir(), "sum.go")
 	os.WriteFile(fixed, []byte(fixture.FixedSum), 0o644)
-	sh, _ := ParseAdapter(`shell:test -n "$BENCH_PROMPT" && test -f "$BENCH_PROMPT_FILE" && cp ` + fixed + ` calc/sum.go`)
+	sh, _ := ParseAdapter(`shell:test -n "$BENCH_PROMPT" && test -f "$BENCH_PROMPT_FILE" && cp `+fixed+` calc/sum.go`, AdapterOptions{})
 	if r := Evaluate(sh, ts, Options{AgentName: "cp"}); r.PassRate() != 1 || r.Agent != "cp" {
 		t.Fatalf("shell fix: %+v", r.Results)
 	}
 	// An agent that edits the held-out test to cheat must not benefit.
-	cheat, _ := ParseAdapter(`shell:printf 'package calc\n' > calc/sum_test.go && echo '// x' >> calc/sum.go`)
+	cheat, _ := ParseAdapter(`shell:printf 'package calc\n' > calc/sum_test.go && echo '// x' >> calc/sum.go`, AdapterOptions{})
 	if r := Evaluate(cheat, ts, Options{}); r.PassRate() != 0 {
 		t.Fatalf("cheat should fail: %+v", r.Results)
 	}
-	bad, _ := ParseAdapter(`shell:sed -i 's/s := 0/s := 1/' calc/sum.go`)
+	bad, _ := ParseAdapter(`shell:sed -i 's/s := 0/s := 1/' calc/sum.go`, AdapterOptions{})
 	r = Evaluate(bad, ts, Options{})
 	if r.PassRate() != 0 || r.Results[0].AgentDiff == "" {
 		t.Fatalf("bad: %+v", r.Results)
 	}
-	broken, _ := ParseAdapter(`shell:exit 3`)
+	broken, _ := ParseAdapter(`shell:exit 3`, AdapterOptions{})
 	if r := Evaluate(broken, ts, Options{}); r.Results[0].FailureMode != "agent_error" {
 		t.Fatalf("broken: %+v", r.Results)
 	}
@@ -62,7 +62,7 @@ func TestParseRisk(t *testing.T) {
 	if parseRisk([]byte("nope")) != nil {
 		t.Fatal("expected nil")
 	}
-	if _, err := ParseAdapter("claude"); err == nil {
+	if _, err := ParseAdapter("nonexistent-agent", AdapterOptions{}); err == nil {
 		t.Fatal("expected error")
 	}
 }

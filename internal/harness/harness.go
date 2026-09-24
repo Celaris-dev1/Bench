@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Celaris-dev1/Bench/internal/classify"
 	"github.com/Celaris-dev1/Bench/internal/detect"
+	"github.com/Celaris-dev1/Bench/internal/dockerx"
 	"github.com/Celaris-dev1/Bench/internal/gitx"
 	"github.com/Celaris-dev1/Bench/internal/task"
 	"github.com/Celaris-dev1/Bench/internal/testrun"
@@ -28,48 +30,148 @@ type Workspace interface {
 	Apply(patch string) error
 }
 
+// AgentInfo is what an Adapter's turn observed, returned alongside its
+// error. Adapters that cannot determine transcript/usage leave it zero.
+type AgentInfo struct {
+	Transcript string
+	TokensIn   int
+	TokensOut  int
+	CostUSD    *float64
+}
+
 // Adapter produces changes in a workspace for a task.
 type Adapter interface {
 	Name() string
-	Solve(ctx context.Context, ws Workspace, t task.Task) error
+	Solve(ctx context.Context, ws Workspace, t task.Task) (AgentInfo, error)
 }
 
 // Gold applies the reference fix (upper-bound baseline).
 type Gold struct{}
 
 func (Gold) Name() string { return "gold" }
-func (Gold) Solve(_ context.Context, ws Workspace, t task.Task) error {
-	return ws.Apply(t.GoldDiff)
+func (Gold) Solve(_ context.Context, ws Workspace, t task.Task) (AgentInfo, error) {
+	return AgentInfo{}, ws.Apply(t.GoldDiff)
 }
 
 // Noop makes no changes (lower-bound baseline).
 type Noop struct{}
 
-func (Noop) Name() string                                     { return "noop" }
-func (Noop) Solve(context.Context, Workspace, task.Task) error { return nil }
+func (Noop) Name() string { return "noop" }
+func (Noop) Solve(context.Context, Workspace, task.Task) (AgentInfo, error) {
+	return AgentInfo{}, nil
+}
 
-// Shell runs an arbitrary command in the workspace. The prompt is passed via
-// BENCH_PROMPT and BENCH_PROMPT_FILE; the workspace path via BENCH_WORKTREE.
-type Shell struct{ Command string }
+// scratchDir is a directory inside the workspace used to pass the prompt to
+// command-based adapters (and, for real agent CLIs, capture their
+// transcript/session files). It is always removed before the agent's diff
+// is computed, and is excluded from that diff defensively either way, so it
+// never shows up as a spurious "change" the agent made.
+const scratchDir = ".bench-agent"
 
-func (s Shell) Name() string { return "shell" }
-func (s Shell) Solve(ctx context.Context, ws Workspace, t task.Task) error {
-	pf, err := os.CreateTemp("", "bench-prompt-*.md")
-	if err != nil {
-		return err
+// BuildInput is what a CommandAdapter.Build function is given to construct
+// its argv and env.
+type BuildInput struct {
+	WorkspaceDir  string // host path to the workspace (== Workspace.Path())
+	PromptFile    string // absolute host path to a file containing the task prompt
+	PromptFileRel string // that same file's path relative to WorkspaceDir (for use inside a container, where WorkspaceDir is mounted at /work)
+	InDocker      bool   // true when the built command will run inside a container (see CommandAdapter.DockerImage), so a Build func must translate any host path (e.g. PromptFile) to its /work-relative form
+	Task          task.Task
+}
+
+// ParseUsage extracts token counts / cost from a command's combined
+// stdout+stderr, when the underlying CLI reports them (e.g. as trailing
+// JSON). It may return zero values if the output carries none.
+type ParseUsage func(output string) (tokensIn, tokensOut int, costUSD *float64)
+
+// CommandAdapter runs a single external command, built by Build, to solve a
+// task. It is the common implementation behind "shell:" and the built-in
+// agent CLIs (claude-code, codex, cursor, aider): all of them just build an
+// argv/env and exec it, so docker wrapping (--agent-docker) and prompt/
+// transcript handling live here once instead of once per adapter.
+type CommandAdapter struct {
+	AgentName     string
+	Build         func(BuildInput) (argv []string, env []string, err error)
+	Usage         ParseUsage // optional
+	DockerImage   string     // if set, the built command runs inside this image via `docker run`
+	DockerNetwork bool       // for DockerImage: allow the container network (most agent CLIs need to reach their API)
+}
+
+func (c CommandAdapter) Name() string { return c.AgentName }
+
+func (c CommandAdapter) Solve(ctx context.Context, ws Workspace, t task.Task) (AgentInfo, error) {
+	scratch := filepath.Join(ws.Path(), scratchDir)
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		return AgentInfo{}, err
 	}
-	defer os.Remove(pf.Name())
-	pf.WriteString(t.Prompt)
-	pf.Close()
-	cmd := exec.CommandContext(ctx, "sh", "-c", s.Command)
-	cmd.Dir = ws.Path()
-	cmd.Env = append(os.Environ(), "BENCH_PROMPT="+t.Prompt, "BENCH_PROMPT_FILE="+pf.Name(),
-		"BENCH_WORKTREE="+ws.Path(), "BENCH_TASK_ID="+t.ID, "BENCH_LANGUAGE="+t.Language)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("agent command failed: %v: %s", err, tail(string(out), 2000))
+	defer os.RemoveAll(scratch)
+	promptAbs := filepath.Join(scratch, "prompt.md")
+	if err := os.WriteFile(promptAbs, []byte(t.Prompt), 0o644); err != nil {
+		return AgentInfo{}, err
 	}
-	return nil
+
+	argv, env, err := c.Build(BuildInput{
+		WorkspaceDir:  ws.Path(),
+		PromptFile:    promptAbs,
+		PromptFileRel: scratchDir + "/prompt.md",
+		InDocker:      c.DockerImage != "",
+		Task:          t,
+	})
+	if err != nil {
+		return AgentInfo{}, err
+	}
+	if len(argv) == 0 {
+		return AgentInfo{}, fmt.Errorf("%s: empty command", c.AgentName)
+	}
+
+	var cmd *exec.Cmd
+	if c.DockerImage != "" {
+		dargs := append([]string{"docker"}, dockerx.Args(dockerx.RunOptions{
+			Image: c.DockerImage, Dir: ws.Path(), Network: c.DockerNetwork,
+			Env: env, Command: argv,
+		})...)
+		cmd = exec.CommandContext(ctx, dargs[0], dargs[1:]...)
+		cmd.Env = os.Environ()
+	} else {
+		cmd = exec.CommandContext(ctx, argv[0], argv[1:]...)
+		cmd.Dir = ws.Path()
+		cmd.Env = append(os.Environ(), env...)
+	}
+
+	out, runErr := cmd.CombinedOutput()
+	info := AgentInfo{Transcript: string(out)}
+	if c.Usage != nil {
+		info.TokensIn, info.TokensOut, info.CostUSD = c.Usage(string(out))
+	}
+	if runErr != nil {
+		if _, ok := runErr.(*exec.Error); ok {
+			return info, fmt.Errorf("%s: %w (is it installed and on PATH?)", c.AgentName, runErr)
+		}
+		return info, fmt.Errorf("agent command failed: %v: %s", runErr, tail(string(out), 2000))
+	}
+	return info, nil
+}
+
+// Shell runs an arbitrary shell command in the workspace. The prompt is
+// passed via BENCH_PROMPT and BENCH_PROMPT_FILE; the workspace path via
+// BENCH_WORKTREE. With DockerImage set, the command runs inside that image
+// instead (BENCH_WORKTREE/BENCH_PROMPT_FILE are then container paths under
+// /work, and BENCH_PROMPT is omitted to avoid unbounded -e argument sizes).
+func Shell(command, dockerImage string, dockerNetwork bool) CommandAdapter {
+	return CommandAdapter{
+		AgentName:     "shell",
+		DockerImage:   dockerImage,
+		DockerNetwork: dockerNetwork,
+		Build: func(in BuildInput) ([]string, []string, error) {
+			if dockerImage != "" {
+				return []string{"sh", "-c", command},
+					[]string{"BENCH_PROMPT_FILE=/work/" + in.PromptFileRel, "BENCH_WORKTREE=/work",
+						"BENCH_TASK_ID=" + in.Task.ID, "BENCH_LANGUAGE=" + in.Task.Language}, nil
+			}
+			return []string{"sh", "-c", command},
+				[]string{"BENCH_PROMPT=" + in.Task.Prompt, "BENCH_PROMPT_FILE=" + in.PromptFile,
+					"BENCH_WORKTREE=" + in.WorkspaceDir, "BENCH_TASK_ID=" + in.Task.ID, "BENCH_LANGUAGE=" + in.Task.Language}, nil
+		},
+	}
 }
 
 // injectHeldOut reads each held-out test file's content at t.Commit from the
@@ -99,17 +201,32 @@ func tail(s string, n int) string {
 	return s
 }
 
-// ParseAdapter builds an adapter from a spec: "gold", "noop", or "shell:<cmd>".
-func ParseAdapter(spec string) (Adapter, error) {
+// AdapterOptions carries flags that affect how a parsed adapter runs
+// (currently, agent-side Docker sandboxing).
+type AdapterOptions struct {
+	DockerImage   string // --agent-docker: run the agent's command inside this image
+	DockerNetwork bool   // allow that container network access (default true set by caller; most agents need their API)
+}
+
+// ParseAdapter builds an adapter from a spec: "gold", "noop", "shell:<cmd>",
+// or one of the built-in agent CLIs ("claude-code[:model]", "codex[:model]",
+// "cursor[:model]", "aider[:model]"); see internal/harness/adapters.go.
+func ParseAdapter(spec string, o AdapterOptions) (Adapter, error) {
 	switch {
 	case spec == "gold":
 		return Gold{}, nil
 	case spec == "noop":
 		return Noop{}, nil
 	case strings.HasPrefix(spec, "shell:"):
-		return Shell{Command: strings.TrimPrefix(spec, "shell:")}, nil
+		return Shell(strings.TrimPrefix(spec, "shell:"), o.DockerImage, o.DockerNetwork), nil
 	}
-	return nil, fmt.Errorf("unknown adapter %q (want gold, noop, or shell:<command>)", spec)
+	name, model, _ := strings.Cut(spec, ":")
+	if build, ok := builtinAgents[name]; ok {
+		ca := build(model)
+		ca.DockerImage, ca.DockerNetwork = o.DockerImage, o.DockerNetwork
+		return ca, nil
+	}
+	return nil, fmt.Errorf("unknown adapter %q (want gold, noop, shell:<command>, or one of %s)", spec, builtinAgentNames())
 }
 
 // Options configures a run.
@@ -147,12 +264,12 @@ func Evaluate(a Adapter, tasks []task.Task, o Options) task.Run {
 	return run
 }
 
-// One evaluates a single task. The agent runs inside a leakage-isolated
-// gitx.Sandbox: a fresh, one-commit synthetic repo built from the task's
-// parent tree, with no history and no reachable fix commit. Held-out test
-// files are read from the real repository (outside the sandbox) and
-// injected only after the agent's turn has ended, so an agent can never see
-// them, let alone the fix, from inside its workspace.
+// One evaluates a single task, once. The agent runs inside a
+// leakage-isolated gitx.Sandbox: a fresh, one-commit synthetic repo built
+// from the task's parent tree, with no history and no reachable fix commit.
+// Held-out test files are read from the real repository (outside the
+// sandbox) and injected only after the agent's turn has ended, so an agent
+// can never see them, let alone the fix, from inside its workspace.
 func One(a Adapter, t task.Task, o Options) (res task.Result) {
 	start := time.Now()
 	res = task.Result{TaskID: t.ID}
@@ -172,9 +289,10 @@ func One(a Adapter, t task.Task, o Options) (res task.Result) {
 	defer sb.Remove()
 
 	ctx, cancel := context.WithTimeout(context.Background(), o.AgentTimeout)
-	agentErr := a.Solve(ctx, sb, t)
+	info, agentErr := a.Solve(ctx, sb, t)
 	cancel()
-	res.AgentDiff, _ = sb.Diff(t.TestFiles)
+	res.Transcript, res.TokensIn, res.TokensOut, res.CostUSD = info.Transcript, info.TokensIn, info.TokensOut, info.CostUSD
+	res.AgentDiff, _ = sb.Diff(append(append([]string{}, t.TestFiles...), scratchDir))
 
 	// Restore the sandbox's pristine base, apply only the agent's non-test
 	// changes, then inject the held-out tests -- fetched from the real repo,
