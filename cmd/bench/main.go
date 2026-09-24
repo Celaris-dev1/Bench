@@ -177,7 +177,9 @@ func cmdMine(args []string) error {
 		return err
 	}
 	defer st.Close()
-	_, err = doMine(st, ledger.FromEnv(), m)
+	rec := ledger.FromEnv()
+	defer rec.Stop()
+	_, err = doMine(st, rec, m)
 	return err
 }
 
@@ -287,7 +289,9 @@ func cmdRun(args []string) error {
 		return err
 	}
 	defer st.Close()
-	_, err = doRun(st, ledger.FromEnv(), *agent, f)
+	rec := ledger.FromEnv()
+	defer rec.Stop()
+	_, err = doRun(st, rec, *agent, f)
 	return err
 }
 
@@ -407,6 +411,7 @@ func cmdWatch(args []string) error {
 	}
 	defer st.Close()
 	rec := ledger.FromEnv()
+	defer rec.Stop()
 	m.repo = absRepo(m.repo)
 	f.repo, f.docker, f.timeout = m.repo, m.docker, m.timeout
 	stateFile := filepath.Join(c.data, "watch-"+strings.ReplaceAll(strings.Trim(m.repo, "/"), "/", "_")+".head")
