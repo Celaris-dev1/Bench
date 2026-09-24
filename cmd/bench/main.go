@@ -25,8 +25,9 @@ const usage = `bench — repo-native, self-generating evaluation harness
 Usage:
   bench mine   --repo <path> [--since sha] [--max-diff 400] [--no-verify] [--docker image]
   bench tasks  [--repo <path>]
-  bench run    --agent gold|noop|shell:<cmd> [--name n] [--model m] [--repo path] [--task id] [--gate] [--llm]
+  bench run    --agent gold|noop|shell:<cmd> [--name n] [--model m] [--repo path] [--task id] [--gate] [--llm] [--trials N]
   bench report [--format md|html] [--out file] [--repo path]
+  bench compare --a agentName[/model] --b agentName[/model] [--repo path]
   bench watch  --repo <path> [--interval 60s] [--agent spec ...] [--once]
 
 Storage: BENCH_DATABASE_URL (postgres://...) or JSON files under --data (default .bench).
@@ -48,6 +49,8 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "report":
 		err = cmdReport(os.Args[2:])
+	case "compare":
+		err = cmdCompare(os.Args[2:])
 	case "watch":
 		err = cmdWatch(os.Args[2:])
 	case "-h", "--help", "help":
@@ -198,7 +201,7 @@ func doRun(st store.Store, rec *ledger.Recorder, spec string, f runFlags) (task.
 	if name == "" {
 		name = a.Name()
 	}
-	run := harness.Evaluate(a, sel, harness.Options{AgentName: name, Model: f.model, UseGate: f.gate, UseLLM: f.llm, AgentTimeout: f.agentTimeout,
+	run := harness.Evaluate(a, sel, harness.Options{AgentName: name, Model: f.model, UseGate: f.gate, UseLLM: f.llm, AgentTimeout: f.agentTimeout, Trials: f.trials,
 		Test: testrun.Options{Timeout: f.timeout, DockerImage: f.docker}, Log: logf})
 	if err := st.SaveRun(context.Background(), run); err != nil {
 		return run, err
@@ -284,6 +287,64 @@ func cmdReport(args []string) error {
 		return report.HTML(w, es)
 	}
 	report.Markdown(w, es)
+	return nil
+}
+
+// latestRun returns the most recent run for spec ("agent" or "agent/model").
+func latestRun(runs []task.Run, spec string) (task.Run, error) {
+	agent, model, _ := strings.Cut(spec, "/")
+	var best task.Run
+	found := false
+	for _, r := range runs {
+		if r.Agent != agent || (model != "" && r.Model != model) {
+			continue
+		}
+		if !found || r.StartedAt.After(best.StartedAt) {
+			best, found = r, true
+		}
+	}
+	if !found {
+		return task.Run{}, fmt.Errorf("no run found for %q", spec)
+	}
+	return best, nil
+}
+
+func cmdCompare(args []string) error {
+	fs := flag.NewFlagSet("compare", flag.ExitOnError)
+	var c common
+	c.bind(fs)
+	a := fs.String("a", "", "first agent, as \"agent\" or \"agent/model\" (uses its latest run)")
+	b := fs.String("b", "", "second agent, as \"agent\" or \"agent/model\"")
+	repo := fs.String("repo", "", "filter by repository")
+	fs.Parse(args)
+	if *a == "" || *b == "" {
+		return fmt.Errorf("--a and --b required")
+	}
+	st, err := c.open()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	runs, err := st.Runs(context.Background(), absRepo(*repo))
+	if err != nil {
+		return err
+	}
+	ra, err := latestRun(runs, *a)
+	if err != nil {
+		return err
+	}
+	rb, err := latestRun(runs, *b)
+	if err != nil {
+		return err
+	}
+	cmp := report.Compare(ra, rb)
+	fmt.Printf("%s/%s: %.1f%%   %s/%s: %.1f%%   (%d common tasks)\n", cmp.AgentA, cmp.ModelA, cmp.PassRateA*100, cmp.AgentB, cmp.ModelB, cmp.PassRateB*100, cmp.TasksCompared)
+	fmt.Printf("McNemar: chi2=%.3f p=%.4f (A-only wins=%d, B-only wins=%d)\n", cmp.McNemarChi2, cmp.McNemarP, cmp.AOnly, cmp.BOnly)
+	sig := "not significant"
+	if cmp.Significant {
+		sig = "SIGNIFICANT"
+	}
+	fmt.Printf("Paired bootstrap: diff=%+.1f pts, 95%% CI=[%+.1f, %+.1f] pts -- %s\n", cmp.DiffEstimate*100, cmp.DiffCILo*100, cmp.DiffCIHi*100, sig)
 	return nil
 }
 

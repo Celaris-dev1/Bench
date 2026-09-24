@@ -49,6 +49,15 @@ type Run struct {
 	Results   []Result  `json:"results"`
 }
 
+// PerTask groups a run's results by task id, preserving trial order.
+func (r Run) PerTask() map[string][]Result {
+	m := map[string][]Result{}
+	for _, x := range r.Results {
+		m[x.TaskID] = append(m[x.TaskID], x)
+	}
+	return m
+}
+
 // PassRate returns fraction of passed results.
 func (r Run) PassRate() float64 {
 	if len(r.Results) == 0 {

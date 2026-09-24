@@ -236,6 +236,7 @@ type Options struct {
 	Test             testrun.Options
 	UseGate          bool
 	UseLLM           bool
+	Trials           int // trials per task, for pass@k and flakiness (default 1)
 	Log              func(string, ...any)
 }
 
@@ -250,6 +251,9 @@ func Evaluate(a Adapter, tasks []task.Task, o Options) task.Run {
 	if o.AgentTimeout == 0 {
 		o.AgentTimeout = 30 * time.Minute
 	}
+	if o.Trials <= 0 {
+		o.Trials = 1
+	}
 	b := make([]byte, 6)
 	rand.Read(b)
 	run := task.Run{ID: time.Now().UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b), Agent: o.AgentName, Model: o.Model, StartedAt: time.Now().UTC()}
@@ -257,9 +261,11 @@ func Evaluate(a Adapter, tasks []task.Task, o Options) task.Run {
 		run.Repo = tasks[0].Repo
 	}
 	for _, t := range tasks {
-		r := One(a, t, o)
-		o.Log("%s %s pass=%v %s", run.Agent, t.ID, r.Passed, r.FailureMode)
-		run.Results = append(run.Results, r)
+		for trial := 0; trial < o.Trials; trial++ {
+			r := One(a, t, o)
+			o.Log("%s %s trial=%d/%d pass=%v %s", run.Agent, t.ID, trial+1, o.Trials, r.Passed, r.FailureMode)
+			run.Results = append(run.Results, r)
+		}
 	}
 	return run
 }

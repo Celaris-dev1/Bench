@@ -32,6 +32,10 @@ func TestEndToEnd(t *testing.T) {
 	}
 	run("run", "--agent", "gold", "--data", data)
 	run("run", "--agent", "noop", "--data", data)
+	cmp := run("compare", "--a", "gold", "--b", "noop", "--data", data)
+	if !strings.Contains(cmp, "1 common tasks") || !strings.Contains(cmp, "McNemar") {
+		t.Fatal(cmp)
+	}
 	md := run("report", "--data", data)
 	if !strings.Contains(md, "| 1 | gold |  | 1/1 | 100.0%") || !strings.Contains(md, "no_change×1") {
 		t.Fatal(md)
