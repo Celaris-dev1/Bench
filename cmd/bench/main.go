@@ -24,6 +24,9 @@ const usage = `bench — repo-native, self-generating evaluation harness
 
 Usage:
   bench mine   --repo <path> [--since sha] [--max-diff 400] [--no-verify] [--docker image]
+  bench mine   --github owner/repo [--repo <local-clone>] [--max-prs N]  (GITHUB_TOKEN optional)
+  bench mine   --from-gate <gate-results.json-or-dir> [--repo <local-clone>]
+  bench mine   --from-ledger <ledger-url> --chain <chain> [--repo <local-clone>]
   bench tasks  [--repo <path>]
   bench run    --agent gold|noop|shell:<cmd> [--name n] [--model m] [--repo path] [--task id] [--gate] [--llm] [--trials N]
   bench report [--format md|html] [--out file] [--repo path]
@@ -94,10 +97,10 @@ func absRepo(p string) string {
 }
 
 type mineFlags struct {
-	repo, since, docker string
-	maxDiff, maxCommits int
-	noVerify            bool
-	timeout             time.Duration
+	repo, since, docker, github string
+	maxDiff, maxCommits, maxPRs int
+	noVerify                    bool
+	timeout                     time.Duration
 }
 
 func bindMine(fs *flag.FlagSet, m *mineFlags) {
@@ -108,11 +111,32 @@ func bindMine(fs *flag.FlagSet, m *mineFlags) {
 	fs.IntVar(&m.maxCommits, "max-commits", 0, "limit commits scanned (0 = all)")
 	fs.BoolVar(&m.noVerify, "no-verify", false, "skip fail-before/pass-after verification")
 	fs.DurationVar(&m.timeout, "test-timeout", 5*time.Minute, "per test invocation timeout")
+	fs.StringVar(&m.github, "github", "", "mine merged PRs from owner/repo via the GitHub API instead of local history (--repo is still used to compute diffs/verify, if given; GITHUB_TOKEN is optional but raises the rate limit)")
+	fs.IntVar(&m.maxPRs, "max-prs", 0, "limit merged PRs scanned with --github (0 = no limit)")
 }
 
 func doMine(st store.Store, rec *ledger.Recorder, m mineFlags) ([]task.Task, error) {
-	tasks, cands, err := mine.Mine(m.repo, mine.Options{Since: m.since, MaxCommits: m.maxCommits, MaxDiffLines: m.maxDiff, Verify: !m.noVerify,
-		Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf})
+	var tasks []task.Task
+	var cands []mine.Candidate
+	var err error
+	if m.github != "" {
+		owner, repo, ok := strings.Cut(m.github, "/")
+		if !ok {
+			return nil, fmt.Errorf("--github wants owner/repo, got %q", m.github)
+		}
+		local := m.repo
+		if local == "." {
+			local = "" // don't accidentally treat cwd as the clone unless the user actually pointed --repo at one
+		}
+		tasks, cands, err = mine.MineGitHub(context.Background(), mine.GitHubOptions{
+			Owner: owner, Repo: repo, Token: os.Getenv("GITHUB_TOKEN"), LocalRepo: absRepo(local),
+			MaxPRs: m.maxPRs, Verify: !m.noVerify, MaxDiffLines: m.maxDiff,
+			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf,
+		})
+	} else {
+		tasks, cands, err = mine.Mine(m.repo, mine.Options{Since: m.since, MaxCommits: m.maxCommits, MaxDiffLines: m.maxDiff, Verify: !m.noVerify,
+			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf})
+	}
 	if err != nil {
 		return nil, err
 	}
