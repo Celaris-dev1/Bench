@@ -98,6 +98,7 @@ func absRepo(p string) string {
 
 type mineFlags struct {
 	repo, since, docker, github string
+	fromGate, fromLedger, chain string
 	maxDiff, maxCommits, maxPRs int
 	noVerify                    bool
 	timeout                     time.Duration
@@ -113,13 +114,23 @@ func bindMine(fs *flag.FlagSet, m *mineFlags) {
 	fs.DurationVar(&m.timeout, "test-timeout", 5*time.Minute, "per test invocation timeout")
 	fs.StringVar(&m.github, "github", "", "mine merged PRs from owner/repo via the GitHub API instead of local history (--repo is still used to compute diffs/verify, if given; GITHUB_TOKEN is optional but raises the rate limit)")
 	fs.IntVar(&m.maxPRs, "max-prs", 0, "limit merged PRs scanned with --github (0 = no limit)")
+	fs.StringVar(&m.fromGate, "from-gate", "", "mine fixes for Gate-rejected changes from a `gate run --format json` results file or directory of them (--repo is the local clone to search for the fix)")
+	fs.StringVar(&m.fromLedger, "from-ledger", "", "mine fixes for incidents recorded on a Ledger chain, e.g. https://ledger.example.com (LEDGER_TOKEN optional; --repo is the local clone to search for the fix)")
+	fs.StringVar(&m.chain, "chain", "incidents", "Ledger chain to read incident records from, with --from-ledger")
 }
 
 func doMine(st store.Store, rec *ledger.Recorder, m mineFlags) ([]task.Task, error) {
 	var tasks []task.Task
 	var cands []mine.Candidate
 	var err error
-	if m.github != "" {
+	switch {
+	case m.fromGate != "":
+		tasks, cands, err = mine.MineFromGate(m.repo, m.fromGate, mine.Options{Verify: !m.noVerify, MaxDiffLines: m.maxDiff,
+			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf})
+	case m.fromLedger != "":
+		tasks, cands, err = mine.MineFromLedger(m.repo, m.fromLedger, os.Getenv("LEDGER_TOKEN"), m.chain, mine.Options{Verify: !m.noVerify, MaxDiffLines: m.maxDiff,
+			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf})
+	case m.github != "":
 		owner, repo, ok := strings.Cut(m.github, "/")
 		if !ok {
 			return nil, fmt.Errorf("--github wants owner/repo, got %q", m.github)
@@ -133,7 +144,7 @@ func doMine(st store.Store, rec *ledger.Recorder, m mineFlags) ([]task.Task, err
 			MaxPRs: m.maxPRs, Verify: !m.noVerify, MaxDiffLines: m.maxDiff,
 			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf,
 		})
-	} else {
+	default:
 		tasks, cands, err = mine.Mine(m.repo, mine.Options{Since: m.since, MaxCommits: m.maxCommits, MaxDiffLines: m.maxDiff, Verify: !m.noVerify,
 			Test: testrun.Options{Timeout: m.timeout, DockerImage: m.docker}, Log: logf})
 	}

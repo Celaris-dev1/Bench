@@ -88,46 +88,68 @@ func Mine(repo string, o Options) ([]task.Task, []Candidate, error) {
 		if !bugWordRe.MatchString(msg) && !issueRefRe.MatchString(msg) {
 			continue
 		}
-		out, err := gitx.Run(abs, "diff-tree", "--no-commit-id", "--name-only", "-r", c.parent, c.sha)
+		cand, ok, err := BuildCandidate(abs, c.sha, c.parent, msg, o)
 		if err != nil {
 			return nil, nil, err
 		}
-		var tests, srcs []string
-		for _, f := range strings.Fields(out) {
-			switch {
-			case detect.IsTest(f):
-				tests = append(tests, f)
-			case detect.IsSource(f):
-				srcs = append(srcs, f)
-			}
-		}
-		if len(tests) == 0 || len(srcs) == 0 {
+		if !ok {
 			continue
-		}
-		t := task.Task{
-			ID: fmt.Sprintf("%s-%s", filepath.Base(abs), c.sha[:10]), Repo: abs, Commit: c.sha, Parent: c.parent,
-			Prompt: msg, IssueRefs: refs(msg), Language: detect.Language(srcs), Runner: detect.Runner(abs, detect.Language(srcs)), TestFiles: tests, SourceFiles: srcs,
-			MinedAt: time.Now().UTC(),
-		}
-		t.GoldDiff, _ = gitx.Run(abs, append([]string{"diff", "--binary", c.parent, c.sha, "--"}, srcs...)...)
-		t.TestDiff, _ = gitx.Run(abs, append([]string{"diff", "--binary", c.parent, c.sha, "--"}, tests...)...)
-		t.DiffLines = countChanged(t.GoldDiff)
-		t.Score = score(t)
-		cand := Candidate{Task: t, Reject: staticReject(t, o)}
-		if cand.Reject == "" && o.Verify {
-			o.Log("verifying %s", t.ID)
-			cand.Reject = verify(abs, &cand.Task, o)
 		}
 		cands = append(cands, cand)
 		if cand.Reject == "" {
 			tasks = append(tasks, cand.Task)
-			o.Log("accepted %s", t.ID)
+			o.Log("accepted %s", cand.Task.ID)
 		} else {
-			o.Log("rejected %s: %s", t.ID, cand.Reject)
+			o.Log("rejected %s: %s", cand.Task.ID, cand.Reject)
 		}
 	}
 	sort.SliceStable(tasks, func(i, j int) bool { return tasks[i].Score > tasks[j].Score })
 	return tasks, cands, nil
+}
+
+// BuildCandidate builds a Candidate task from a specific commit range (parent..sha) with the given
+// prompt text, running the same static-filter and (if o.Verify) fail-before/pass-after checks as
+// Mine's own commit walk. ok is false when the commit touches no held-out tests or no source files
+// (not a rejection worth reporting — just not shaped like a task). abs must be an absolute repo path.
+func BuildCandidate(abs, sha, parent, msg string, o Options) (Candidate, bool, error) {
+	out, err := gitx.Run(abs, "diff-tree", "--no-commit-id", "--name-only", "-r", parent, sha)
+	if err != nil {
+		return Candidate{}, false, err
+	}
+	var tests, srcs []string
+	for _, f := range strings.Fields(out) {
+		switch {
+		case detect.IsTest(f):
+			tests = append(tests, f)
+		case detect.IsSource(f):
+			srcs = append(srcs, f)
+		}
+	}
+	if len(tests) == 0 || len(srcs) == 0 {
+		return Candidate{}, false, nil
+	}
+	t := task.Task{
+		ID: fmt.Sprintf("%s-%s", filepath.Base(abs), shortSHA(sha)), Repo: abs, Commit: sha, Parent: parent,
+		Prompt: msg, IssueRefs: refs(msg), Language: detect.Language(srcs), Runner: detect.Runner(abs, detect.Language(srcs)), TestFiles: tests, SourceFiles: srcs,
+		MinedAt: time.Now().UTC(),
+	}
+	t.GoldDiff, _ = gitx.Run(abs, append([]string{"diff", "--binary", parent, sha, "--"}, srcs...)...)
+	t.TestDiff, _ = gitx.Run(abs, append([]string{"diff", "--binary", parent, sha, "--"}, tests...)...)
+	t.DiffLines = countChanged(t.GoldDiff)
+	t.Score = score(t)
+	cand := Candidate{Task: t, Reject: staticReject(t, o)}
+	if cand.Reject == "" && o.Verify {
+		o.Log("verifying %s", t.ID)
+		cand.Reject = verify(abs, &cand.Task, o)
+	}
+	return cand, true, nil
+}
+
+func shortSHA(s string) string {
+	if len(s) > 10 {
+		return s[:10]
+	}
+	return s
 }
 
 func refs(msg string) []string {
