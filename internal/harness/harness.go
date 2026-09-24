@@ -19,32 +19,41 @@ import (
 	"github.com/Celaris-dev1/Bench/internal/testrun"
 )
 
-// Adapter produces changes in a worktree for a task.
+// Workspace is what an Adapter is given to work in: a directory it can edit
+// freely. In practice it is always a *gitx.Sandbox -- a leakage-isolated,
+// one-commit synthetic repo (see internal/gitx) -- so an agent has no way to
+// reach the fix commit or any history beyond the task's starting point.
+type Workspace interface {
+	Path() string
+	Apply(patch string) error
+}
+
+// Adapter produces changes in a workspace for a task.
 type Adapter interface {
 	Name() string
-	Solve(ctx context.Context, wt *gitx.Worktree, t task.Task) error
+	Solve(ctx context.Context, ws Workspace, t task.Task) error
 }
 
 // Gold applies the reference fix (upper-bound baseline).
 type Gold struct{}
 
 func (Gold) Name() string { return "gold" }
-func (Gold) Solve(_ context.Context, wt *gitx.Worktree, t task.Task) error {
-	return wt.Apply(t.GoldDiff)
+func (Gold) Solve(_ context.Context, ws Workspace, t task.Task) error {
+	return ws.Apply(t.GoldDiff)
 }
 
 // Noop makes no changes (lower-bound baseline).
 type Noop struct{}
 
-func (Noop) Name() string                                           { return "noop" }
-func (Noop) Solve(context.Context, *gitx.Worktree, task.Task) error { return nil }
+func (Noop) Name() string                                     { return "noop" }
+func (Noop) Solve(context.Context, Workspace, task.Task) error { return nil }
 
-// Shell runs an arbitrary command in the worktree. The prompt is passed via
-// BENCH_PROMPT and BENCH_PROMPT_FILE; the worktree path via BENCH_WORKTREE.
+// Shell runs an arbitrary command in the workspace. The prompt is passed via
+// BENCH_PROMPT and BENCH_PROMPT_FILE; the workspace path via BENCH_WORKTREE.
 type Shell struct{ Command string }
 
 func (s Shell) Name() string { return "shell" }
-func (s Shell) Solve(ctx context.Context, wt *gitx.Worktree, t task.Task) error {
+func (s Shell) Solve(ctx context.Context, ws Workspace, t task.Task) error {
 	pf, err := os.CreateTemp("", "bench-prompt-*.md")
 	if err != nil {
 		return err
@@ -53,14 +62,34 @@ func (s Shell) Solve(ctx context.Context, wt *gitx.Worktree, t task.Task) error 
 	pf.WriteString(t.Prompt)
 	pf.Close()
 	cmd := exec.CommandContext(ctx, "sh", "-c", s.Command)
-	cmd.Dir = wt.Dir
+	cmd.Dir = ws.Path()
 	cmd.Env = append(os.Environ(), "BENCH_PROMPT="+t.Prompt, "BENCH_PROMPT_FILE="+pf.Name(),
-		"BENCH_WORKTREE="+wt.Dir, "BENCH_TASK_ID="+t.ID, "BENCH_LANGUAGE="+t.Language)
+		"BENCH_WORKTREE="+ws.Path(), "BENCH_TASK_ID="+t.ID, "BENCH_LANGUAGE="+t.Language)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("agent command failed: %v: %s", err, tail(string(out), 2000))
 	}
 	return nil
+}
+
+// injectHeldOut reads each held-out test file's content at t.Commit from the
+// real repository (t.Repo) -- outside the sandbox entirely -- and writes it
+// into the sandbox directly, bypassing git so the sandbox's own history
+// never has to (and cannot) contain the fix.
+func injectHeldOut(sb *gitx.Sandbox, t task.Task) error {
+	files := make(map[string][]byte, len(t.TestFiles))
+	for _, f := range t.TestFiles {
+		content, ok, err := gitx.ShowFile(t.Repo, t.Commit, f)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			files[f] = nil // deleted at the fix commit
+			continue
+		}
+		files[f] = content
+	}
+	return sb.InjectFiles(files)
 }
 
 func tail(s string, n int) string {
@@ -118,7 +147,12 @@ func Evaluate(a Adapter, tasks []task.Task, o Options) task.Run {
 	return run
 }
 
-// One evaluates a single task.
+// One evaluates a single task. The agent runs inside a leakage-isolated
+// gitx.Sandbox: a fresh, one-commit synthetic repo built from the task's
+// parent tree, with no history and no reachable fix commit. Held-out test
+// files are read from the real repository (outside the sandbox) and
+// injected only after the agent's turn has ended, so an agent can never see
+// them, let alone the fix, from inside its workspace.
 func One(a Adapter, t task.Task, o Options) (res task.Result) {
 	start := time.Now()
 	res = task.Result{TaskID: t.ID}
@@ -128,40 +162,43 @@ func One(a Adapter, t task.Task, o Options) (res task.Result) {
 		res.Error = err.Error()
 		return res
 	}
-	os.Remove(dir)
-	wt, err := gitx.AddWorktree(t.Repo, dir, t.Parent)
+	os.RemoveAll(dir)
+	sb, err := gitx.NewSandbox(t.Repo, t.Parent, dir)
 	if err != nil {
 		res.Error = err.Error()
 		res.FailureMode = classify.AgentError
 		return res
 	}
-	defer wt.Remove()
+	defer sb.Remove()
 
 	ctx, cancel := context.WithTimeout(context.Background(), o.AgentTimeout)
-	agentErr := a.Solve(ctx, wt, t)
+	agentErr := a.Solve(ctx, sb, t)
 	cancel()
-	res.AgentDiff, _ = wt.Diff(t.TestFiles)
+	res.AgentDiff, _ = sb.Diff(t.TestFiles)
 
-	// Restore pristine tree and apply only the agent's non-test changes, then the held-out tests.
-	_, _ = gitx.Run(wt.Dir, "reset", "-q", "--hard", t.Parent)
-	_, _ = gitx.Run(wt.Dir, "clean", "-fdq")
-	applyErr := wt.Apply(res.AgentDiff)
+	// Restore the sandbox's pristine base, apply only the agent's non-test
+	// changes, then inject the held-out tests -- fetched from the real repo,
+	// never from anything reachable inside the sandbox.
+	applyErr := sb.ResetToBase()
 	if applyErr == nil {
-		applyErr = wt.CheckoutFiles(t.Commit, t.TestFiles)
+		applyErr = sb.Apply(res.AgentDiff)
+	}
+	if applyErr == nil {
+		applyErr = injectHeldOut(sb, t)
 	}
 	runner := t.Runner
 	if runner == "" {
-		runner = detect.Runner(wt.Dir, t.Language)
+		runner = detect.Runner(sb.Dir, t.Language)
 	}
 	var out testrun.Outcome
 	if applyErr == nil {
-		out = testrun.Run(wt.Dir, detect.Command(runner, t.TestFiles), o.Test)
+		out = testrun.Run(sb.Dir, detect.Command(runner, t.TestFiles), o.Test)
 	}
 	res.Output = out.Output
 	res.Passed = agentErr == nil && applyErr == nil && out.Passed
 
 	if o.UseGate && strings.TrimSpace(res.AgentDiff) != "" {
-		res.RiskScore = GateRisk(wt.Dir, res.AgentDiff)
+		res.RiskScore = GateRisk(sb.Dir, res.AgentDiff)
 	}
 	if !res.Passed {
 		in := classify.Input{Prompt: t.Prompt, AgentDiff: res.AgentDiff, GoldDiff: t.GoldDiff, Output: out.Output, TimedOut: out.TimedOut, Risk: res.RiskScore}
