@@ -12,6 +12,7 @@ import (
 
 	"github.com/Celaris-dev1/Bench/internal/detect"
 	"github.com/Celaris-dev1/Bench/internal/gitx"
+	"github.com/Celaris-dev1/Bench/internal/pathsafe"
 	"github.com/Celaris-dev1/Bench/internal/task"
 	"github.com/Celaris-dev1/Bench/internal/testrun"
 )
@@ -25,6 +26,12 @@ type Options struct {
 	Test         testrun.Options
 	Log          func(format string, a ...any)
 }
+
+// maxRemoteResponseBytes caps any single HTTP response body or on-disk report file read while
+// mining from an external source (GitHub, Gate, Ledger): all three are outside Bench's control
+// and a malicious or misbehaving one sending gigabytes of JSON should fail cleanly, not exhaust
+// memory.
+const maxRemoteResponseBytes = 32 << 20 // 32MiB
 
 var (
 	issueRefRe = regexp.MustCompile(`(?i)\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s*:?\s*((?:[\w.-]+/[\w.-]+)?#\d+)`)
@@ -118,6 +125,13 @@ func BuildCandidate(abs, sha, parent, msg string, o Options) (Candidate, bool, e
 	}
 	var tests, srcs []string
 	for _, f := range strings.Fields(out) {
+		// Paths come straight from a commit's own tree, but a task's TestFiles/SourceFiles are
+		// later used (e.g. gitx.Worktree.CheckoutFiles, dockerx sandbox file injection) as
+		// relative paths into a fresh worktree/sandbox; reject anything that wouldn't stay
+		// inside it rather than trust every commit a repo's history ever contained.
+		if !pathsafe.Check(f) {
+			continue
+		}
 		switch {
 		case detect.IsTest(f):
 			tests = append(tests, f)

@@ -57,6 +57,9 @@ func loadGateReports(path string) ([]gateReport, error) {
 	}
 	var reports []gateReport
 	for _, f := range files {
+		if fi, err := os.Stat(f); err == nil && fi.Size() > maxRemoteResponseBytes {
+			return nil, fmt.Errorf("%s: %d bytes, exceeds %d byte limit", f, fi.Size(), int64(maxRemoteResponseBytes))
+		}
 		b, err := os.ReadFile(f)
 		if err != nil {
 			return nil, err

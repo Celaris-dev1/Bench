@@ -3,6 +3,7 @@ package mine
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -57,7 +58,7 @@ func FetchLedgerRecords(url, token, chain string) ([]ledgerRecord, error) {
 			return nil, err
 		}
 		var page ledgerListResponse
-		err = json.NewDecoder(resp.Body).Decode(&page)
+		err = json.NewDecoder(io.LimitReader(resp.Body, maxRemoteResponseBytes+1)).Decode(&page)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("ledger: GET /v1/records: status %d", resp.StatusCode)
